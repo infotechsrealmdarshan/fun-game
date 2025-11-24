@@ -6,23 +6,35 @@ import authHelper from "../utils/authHelper.js";
 import redisClient from "../config/redis.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 
+const generateUniqueAcNumber = async () => {
+  let acnumber;
+  let exists = true;
+
+  while (exists) {
+    acnumber = Math.floor(100000 + Math.random() * 900000).toString(); // 6 digits
+    exists = await User.exists({ acnumber });
+  }
+
+  return acnumber;
+};
+
+
 /* ---------------- Register User ---------------- */
 export const registerUser = async (req, res) => {
   try {
-    const { acnumber, email, password, mobile } = req.body;
+    const { email, password, mobile } = req.body;
 
-    if (!acnumber || !email || !password || !mobile) {
-      return errorResponse(
-        res,
-        "acnumber, email, password and mobile are required",
-        400
-      );
+    if (!email || !password || !mobile) {
+      return errorResponse(res, "email, password and mobile are required", 400);
     }
 
     const existingUser = await User.findOne({ email });
     if (existingUser) {
       return errorResponse(res, "Email already exists", 400);
     }
+
+    // 🔥 Auto-generate unique 6-digit account number
+    const acnumber = await generateUniqueAcNumber();
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
@@ -32,7 +44,7 @@ export const registerUser = async (req, res) => {
       email,
       password: hashedPassword,
       mobile,
-      coins: 1000, 
+      coins: 1000,
     });
 
     await newUser.save();
@@ -50,10 +62,10 @@ export const registerUser = async (req, res) => {
         accessToken,
         user: {
           _id: newUser._id,
-          acnumber: newUser.acnumber,
+          acnumber: newUser.acnumber, // 👈 Auto-generated
           email: newUser.email,
           mobile: newUser.mobile,
-          coins: newUser.coins, 
+          coins: newUser.coins,
           createdAt: newUser.createdAt,
         },
       },
