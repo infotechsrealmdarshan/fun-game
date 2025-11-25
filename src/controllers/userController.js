@@ -82,8 +82,8 @@ export const registerUser = async (req, res) => {
 /* ---------------- Login User ---------------- */
 export const loginUser = async (req, res) => {
   try {
-    const { acnumber, password } = req.body;
-    const user = await User.findOne({ acnumber }).select("+password");
+    const { email, password } = req.body;
+    const user = await User.findOne({ email }).select("+password");
 
     if (!user)
       return successResponse(res, "User not found", null, null, 200, 0);
