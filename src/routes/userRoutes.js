@@ -72,12 +72,12 @@ router.post("/register", registerUser);
  *           schema:
  *             type: object
  *             required:
- *               - acnumber
+ *               - email
  *               - password
  *             properties:
- *               acnumber:
+ *               email:
  *                 type: string
- *                 example: "123dabc"
+ *                 example: "user@example.com"
  *               password:
  *                 type: string
  *                 example: "Password123@"
