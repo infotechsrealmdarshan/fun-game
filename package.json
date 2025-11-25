@@ -5,11 +5,10 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js",
+    "start": "pm2 start index.js --name backend-server",
+    "stop": "pm2 stop backend-server || true",
+    "restart": "pm2 restart backend-server || pm2 start index.js --name backend-server",
     "dev": "nodemon index.js",
-    "pm2:start": "pm2 start index.js --name backend-server",
-    "pm2:stop": "pm2 stop backend-server",
-    "pm2:restart": "pm2 restart backend-server",
     "pm2:logs": "pm2 logs backend-server"
   },
   "keywords": [],
