@@ -1,10 +1,11 @@
+// controllers/userController.js
 import User from "../models/User.js";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { successResponse, errorResponse } from "../utils/response.js";
 import authHelper from "../utils/authHelper.js";
 import redisClient from "../config/redis.js";
-import { asyncHandler } from "../utils/asyncHandler.js";
+import { emitToUser, isSocketReady } from "../config/socketConfig.js"; // Add this import
 
 const generateUniqueAcNumber = async () => {
   let acnumber;
@@ -17,7 +18,6 @@ const generateUniqueAcNumber = async () => {
 
   return acnumber;
 };
-
 
 /* ---------------- Register User ---------------- */
 export const registerUser = async (req, res) => {
@@ -236,6 +236,22 @@ export const claimWinnings = async (req, res) => {
 
     await user.save();
 
+    // 🔥 REAL-TIME BALANCE UPDATE - Winnings claimed
+    if (isSocketReady()) {
+      emitToUser(userId.toString(), "balanceUpdate", {
+        success: true,
+        message: "Winnings claimed successfully",
+        data: {
+          coins: user.coins,
+          pendingWinningCoins: user.pendingWinningCoins,
+          totalBalance: user.coins + user.pendingWinningCoins,
+          claimedAmount: winnings,
+          type: "winnings_claimed"
+        },
+        timestamp: new Date().toISOString()
+      });
+    }
+
     return res.status(200).json({
       success: true,
       message: "Winnings claimed successfully",
@@ -252,6 +268,7 @@ export const claimWinnings = async (req, res) => {
     });
   }
 };
+
 /* ---------------- Get User Winning Balance ---------------- */
 export const getWinningBalance = async (req, res) => {
   try {

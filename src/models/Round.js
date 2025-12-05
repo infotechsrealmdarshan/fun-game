@@ -5,9 +5,17 @@ const roundSchema = new mongoose.Schema(
   {
     roundId: { type: String, required: true, unique: true, index: true },
     roundNumber: { type: Number, required: true, unique: true },
-    phase: { type: String, enum: ["bidding", "hold", "completed"], default: "bidding" },
+    phase: {
+      type: String,
+      enum: ["bidding", "calculating", "playSpin", "hold", "completed"], // ADD "playSpin" here
+      default: "bidding"
+    },
     winningNumber: { type: Number, default: null },
-    status: { type: String, enum: ["running", "completed", "waiting"], default: "running" },
+    status: {
+      type: String,
+      enum: ["running", "completed"],
+      default: "running"
+    },
     winnerAnnounced: { type: Boolean, default: false },
     startTime: { type: Date, default: Date.now },
     manualWinner: {

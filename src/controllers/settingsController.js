@@ -1,3 +1,4 @@
+// controllers/settingsController.js
 import Settings from "../models/Settings.js";
 import Round from "../models/Round.js";
 
@@ -62,7 +63,8 @@ export const updateSettings = async (req, res) => {
     });
   }
 };
-// Set manual winner (Admin only)
+
+// Set manual winner (Admin only) - UPDATED FOR 50s-57s WINDOW
 export const setManualWinner = async (req, res) => {
   try {
     const { winningNumber } = req.body;
@@ -82,11 +84,21 @@ export const setManualWinner = async (req, res) => {
       });
     }
 
-    // Check if in hold phase
-    if (round.phase !== "hold") {
+    // 🔥 ENHANCED DUPLICATE PREVENTION
+    if (round.isManualWinner) {
+      const existingManual = round.manualWinner === 10 ? 0 : round.manualWinner;
       return res.status(400).json({
         success: false,
-        message: "Manual winner can only be set during hold phase"
+        message: `Manual winner already set to ${existingManual} for this round`
+      });
+    }
+
+    // Check if in manual winner window (50s to 57s)
+    const elapsedSec = Math.floor((Date.now() - new Date(round.startTime).getTime()) / 1000);
+    if (elapsedSec < 50 || elapsedSec >= 57) {
+      return res.status(400).json({
+        success: false,
+        message: "Manual winner can only be set between 50-57 seconds of the round"
       });
     }
 
@@ -95,12 +107,26 @@ export const setManualWinner = async (req, res) => {
     round.isManualWinner = true;
     await round.save();
 
+    console.log(`🔧 MANUAL WINNER SET: Round ${round.roundNumber}, Number: ${winningNumber}`);
+
+    // Emit event to all clients about manual winner set
+    const { emitToAll, isSocketReady } = await import("../config/socketConfig.js");
+    if (isSocketReady()) {
+      emitToAll("manualWinnerSet", {
+        roundNumber: round.roundNumber,
+        winningNumber: winningNumber,
+        message: "Admin has set manual winner - Will be displayed shortly",
+        timestamp: new Date().toISOString()
+      });
+    }
+
     return res.status(200).json({
       success: true,
       message: "Manual winner set successfully",
       data: {
         roundNumber: round.roundNumber,
-        winningNumber: winningNumber
+        winningNumber: winningNumber,
+        timeRemaining: 68 - elapsedSec
       }
     });
   } catch (err) {

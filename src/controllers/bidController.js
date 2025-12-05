@@ -2,6 +2,7 @@
 import Round from "../models/Round.js";
 import Bid from "../models/Bid.js";
 import User from "../models/User.js";
+import { emitToUser, isSocketReady } from "../config/socketConfig.js"; // Add this import
 
 // map 0 -> 10 (DB stores 10 instead of 0)
 const mapInputToStored = (n) => (n === 0 ? 10 : n);
@@ -40,12 +41,12 @@ export const placeBid = async (req, res) => {
       });
     }
 
-    // Check bidding window (first 45 seconds) - UPDATED
+    // Check bidding window (first 57 seconds)
     const elapsedSec = Math.floor((Date.now() - new Date(round.startTime).getTime()) / 1000);
-    if (elapsedSec >= 45 || round.phase === "hold") {
+    if (elapsedSec >= 57) { // BLOCK BIDDING WHEN 11s REMAINING (68-57=11s)
       return res.status(400).json({
         success: false,
-        message: "Bidding window closed (after 45 seconds)",
+        message: "Bidding window closed (after 57 seconds)",
       });
     }
 
@@ -81,6 +82,22 @@ export const placeBid = async (req, res) => {
       await existingBid.save();
       await user.save();
 
+      // 🔥 REAL-TIME BALANCE UPDATE - Bid updated
+      if (isSocketReady()) {
+        emitToUser(userId.toString(), "balanceUpdate", {
+          success: true,
+          message: "Bid updated successfully",
+          data: {
+            coins: user.coins,
+            pendingWinningCoins: user.pendingWinningCoins,
+            totalBalance: user.coins + user.pendingWinningCoins,
+            bidAmount: amount,
+            type: "bid_updated"
+          },
+          timestamp: new Date().toISOString()
+        });
+      }
+
       return res.status(200).json({
         success: true,
         message: "Bid updated successfully",
@@ -104,6 +121,22 @@ export const placeBid = async (req, res) => {
 
     user.coins -= amount;
     await user.save();
+
+    // 🔥 REAL-TIME BALANCE UPDATE - New bid placed
+    if (isSocketReady()) {
+      emitToUser(userId.toString(), "balanceUpdate", {
+        success: true,
+        message: "Bid placed successfully",
+        data: {
+          coins: user.coins,
+          pendingWinningCoins: user.pendingWinningCoins,
+          totalBalance: user.coins + user.pendingWinningCoins,
+          bidAmount: amount,
+          type: "bid_placed"
+        },
+        timestamp: new Date().toISOString()
+      });
+    }
 
     return res.status(201).json({
       success: true,

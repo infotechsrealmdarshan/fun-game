@@ -1,9 +1,17 @@
 // config/socketConfig.js
 import { Server } from "socket.io";
 import { startGameTimer } from "../controllers/timerController.js";
+import jwt from "jsonwebtoken";
+import User from "../models/User.js";
 
 let ioInstance = null;
 let isInitialized = false;
+let connectionStats = {
+  totalConnections: 0,
+  activeConnections: 0,
+  failedConnections: 0
+};
+let userSocketMap = new Map(); // Map to store userID -> socket connections
 
 export const initializeSocket = (server) => {
   if (isInitialized) {
@@ -16,39 +24,93 @@ export const initializeSocket = (server) => {
       origin: "*",
       methods: ["GET", "POST"]
     },
-    transports: ['websocket', 'polling']
+    transports: ['websocket', 'polling'],
+    pingTimeout: 60000,
+    pingInterval: 25000,
+    maxHttpBufferSize: 1e8,
+    connectTimeout: 45000
   });
 
   ioInstance = io;
   isInitialized = true;
 
-  console.log("✅ Socket.IO initialized");
+  console.log("✅ Socket.IO initialized with enhanced settings");
 
-  // Handle socket connections
+  // Handle socket connections with better error handling
   io.on("connection", (socket) => {
-    console.log("🟢 User connected:", socket.id, "Total clients:", io.engine.clientsCount);
+    connectionStats.totalConnections++;
+    connectionStats.activeConnections = io.engine.clientsCount;
     
-    // Send immediate welcome message
+    console.log(`🟢 User connected: ${socket.id}, Active: ${connectionStats.activeConnections}`);
+    
+    // Enhanced welcome with connection info
     socket.emit("welcome", {
       message: "Connected to game server",
       socketId: socket.id,
       timestamp: new Date().toISOString(),
-      serverTime: Date.now()
+      serverTime: Date.now(),
+      connectionId: connectionStats.totalConnections
     });
 
-    // Send test event to verify connection
-    socket.emit("testEvent", {
-      message: "Socket connection successful",
-      type: "connection_test",
-      timestamp: new Date().toISOString()
-    });
-
-    // Send immediate timer update to new connection
+    // Send current game state immediately
     if (global.currentGameState) {
       socket.emit("timerUpdate", global.currentGameState);
     }
 
-    // Listen for client events
+    // Handle user authentication
+    socket.on("authenticate", async (data) => {
+      try {
+        const { token } = data;
+        if (!token) {
+          socket.emit("authentication_failed", { message: "No token provided" });
+          return;
+        }
+
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const user = await User.findById(decoded.id);
+        
+        if (!user) {
+          socket.emit("authentication_failed", { message: "User not found" });
+          return;
+        }
+
+        // Store user-socket mapping
+        userSocketMap.set(user._id.toString(), socket.id);
+        socket.userId = user._id.toString();
+
+        socket.emit("authenticated", {
+          success: true,
+          message: "Authentication successful",
+          user: {
+            id: user._id,
+            email: user.email,
+            acnumber: user.acnumber
+          },
+          timestamp: new Date().toISOString()
+        });
+
+        console.log(`✅ User authenticated: ${user.email} (${user._id})`);
+
+        // Send initial balance
+        socket.emit("balanceUpdate", {
+          success: true,
+          message: "Initial balance",
+          data: {
+            coins: user.coins,
+            pendingWinningCoins: user.pendingWinningCoins,
+            totalBalance: user.coins + user.pendingWinningCoins,
+            type: "initial"
+          },
+          timestamp: new Date().toISOString()
+        });
+
+      } catch (error) {
+        console.error("❌ Socket authentication error:", error);
+        socket.emit("authentication_failed", { message: "Invalid token" });
+      }
+    });
+
+    // Handle client events
     socket.on("joinGame", (data) => {
       console.log("🎮 User joined game:", socket.id);
       socket.emit("gameJoined", {
@@ -58,16 +120,49 @@ export const initializeSocket = (server) => {
       });
     });
 
+    // Ping-pong for connection health
+    socket.on("ping", (data) => {
+      socket.emit("pong", {
+        timestamp: new Date().toISOString(),
+        serverTime: Date.now()
+      });
+    });
+
     socket.on("disconnect", (reason) => {
-      console.log("🔴 User disconnected:", socket.id, "Reason:", reason, "Remaining clients:", io.engine.clientsCount);
+      if (socket.userId) {
+        userSocketMap.delete(socket.userId);
+        console.log(`🔴 User disconnected: ${socket.userId}, Reason: ${reason}`);
+      } else {
+        console.log(`🔴 Anonymous user disconnected: ${socket.id}, Reason: ${reason}`);
+      }
+      connectionStats.activeConnections = io.engine.clientsCount;
     });
 
     socket.on("error", (error) => {
       console.log("❌ Socket error:", socket.id, error);
+      connectionStats.failedConnections++;
+    });
+
+    // Force clean up on socket close
+    socket.on("close", () => {
+      console.log("🔴 Socket closed:", socket.id);
     });
   });
 
-  // Start game timer after a short delay to ensure everything is ready
+  // Enhanced heartbeat with connection monitoring
+  setInterval(() => {
+    if (io.engine.clientsCount > 0) {
+      io.emit("heartbeat", {
+        message: "Server heartbeat",
+        timestamp: new Date().toISOString(),
+        connectedClients: io.engine.clientsCount,
+        serverUptime: process.uptime(),
+        connectionStats: connectionStats
+      });
+    }
+  }, 10000); // Reduced to 10s for better monitoring
+
+  // Start game timer after ensuring socket is ready
   setTimeout(() => {
     console.log("🎮 Starting game timer from socket config...");
     startGameTimer().then(() => {
@@ -75,26 +170,14 @@ export const initializeSocket = (server) => {
     }).catch(err => {
       console.error("❌ Failed to start game timer:", err);
     });
-  }, 1000);
-
-  // Test event emitter (for debugging)
-  setInterval(() => {
-    if (io.engine.clientsCount > 0) {
-      io.emit("heartbeat", {
-        message: "Server heartbeat",
-        timestamp: new Date().toISOString(),
-        connectedClients: io.engine.clientsCount,
-        serverUptime: process.uptime()
-      });
-    }
-  }, 5000);
+  }, 2000);
 
   return io;
 };
 
 export const getIO = () => {
   if (!ioInstance) {
-    console.log("⚠️ Socket.IO instance not available yet");
+    throw new Error("Socket.IO instance not initialized");
   }
   return ioInstance;
 };
@@ -102,26 +185,54 @@ export const getIO = () => {
 export const emitToAll = (event, data) => {
   if (ioInstance && isInitialized) {
     // Store current game state for new connections
-    if (event === "timerUpdate") {
-      global.currentGameState = { ...data, event: event };
+    if (event === "timerUpdate" || event === "phaseChange") {
+      global.currentGameState = { ...data, event: event, lastUpdate: Date.now() };
     }
     
     ioInstance.emit(event, data);
     console.log(`📡 [SOCKET] Emitted ${event} to ${ioInstance.engine.clientsCount} clients`);
+    return true;
   } else {
     console.log(`❌ No Socket.IO instance available for event: ${event}`);
+    return false;
   }
 };
 
 export const emitToRoom = (room, event, data) => {
   if (ioInstance && isInitialized) {
     ioInstance.to(room).emit(event, data);
+    return true;
   } else {
     console.log(`❌ No Socket.IO instance available for room event: ${event}`);
+    return false;
   }
 };
 
-// ✅ ADD THIS FUNCTION - Check if socket is ready
+// 🔥 NEW: Emit to specific user
+export const emitToUser = (userId, event, data) => {
+  if (!ioInstance || !isInitialized) {
+    console.log(`❌ Socket not ready for user event: ${event}`);
+    return false;
+  }
+
+  const socketId = userSocketMap.get(userId);
+  if (socketId) {
+    ioInstance.to(socketId).emit(event, data);
+    console.log(`📡 [USER] Emitted ${event} to user: ${userId}`);
+    return true;
+  } else {
+    console.log(`⚠️ User ${userId} not connected for event: ${event}`);
+    return false;
+  }
+};
+
 export const isSocketReady = () => {
   return ioInstance && isInitialized;
+};
+
+export const getConnectionStats = () => {
+  return {
+    ...connectionStats,
+    activeConnections: ioInstance ? ioInstance.engine.clientsCount : 0
+  };
 };
