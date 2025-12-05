@@ -3,6 +3,7 @@ import { Server } from "socket.io";
 import { startGameTimer } from "../controllers/timerController.js";
 import jwt from "jsonwebtoken";
 import User from "../models/User.js";
+import { getLastTenWinnersForSocket } from "../utils/winnerHelper.js";
 
 let ioInstance = null;
 let isInitialized = false;
@@ -37,12 +38,12 @@ export const initializeSocket = (server) => {
   console.log("✅ Socket.IO initialized with enhanced settings");
 
   // Handle socket connections with better error handling
-  io.on("connection", (socket) => {
+  io.on("connection", async (socket) => {
     connectionStats.totalConnections++;
     connectionStats.activeConnections = io.engine.clientsCount;
-    
+
     console.log(`🟢 User connected: ${socket.id}, Active: ${connectionStats.activeConnections}`);
-    
+
     // Enhanced welcome with connection info
     socket.emit("welcome", {
       message: "Connected to game server",
@@ -51,6 +52,30 @@ export const initializeSocket = (server) => {
       serverTime: Date.now(),
       connectionId: connectionStats.totalConnections
     });
+
+    // 🔥 NEW: Send last 10 winners on connect
+    try {
+      const winnersData = await getLastTenWinnersForSocket();
+
+      // EMIT TO SPECIFIC SOCKET
+      socket.emit("lastTenWinners", {
+        success: true,
+        data: winnersData,
+        timestamp: new Date().toISOString()
+      });
+
+      console.log(`📊 Sent last 10 winners to new connection: ${winnersData.lastTenWinnersString}`);
+    } catch (err) {
+      console.error("❌ Error sending last 10 winners:", err);
+
+      // Still emit even on error
+      socket.emit("lastTenWinners", {
+        success: false,
+        data: { lastTenWinners: [], lastTenWinnersString: "" },
+        message: "Could not fetch last winners",
+        timestamp: new Date().toISOString()
+      });
+    }
 
     // Send current game state immediately
     if (global.currentGameState) {
@@ -68,7 +93,7 @@ export const initializeSocket = (server) => {
 
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         const user = await User.findById(decoded.id);
-        
+
         if (!user) {
           socket.emit("authentication_failed", { message: "User not found" });
           return;
@@ -188,7 +213,7 @@ export const emitToAll = (event, data) => {
     if (event === "timerUpdate" || event === "phaseChange") {
       global.currentGameState = { ...data, event: event, lastUpdate: Date.now() };
     }
-    
+
     ioInstance.emit(event, data);
     console.log(`📡 [SOCKET] Emitted ${event} to ${ioInstance.engine.clientsCount} clients`);
     return true;

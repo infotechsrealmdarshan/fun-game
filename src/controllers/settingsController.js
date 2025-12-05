@@ -6,7 +6,7 @@ import Round from "../models/Round.js";
 export const getSettings = async (req, res) => {
   try {
     let settings = await Settings.findOne();
-    
+
     if (!settings) {
       // Create default settings if not exists
       settings = await Settings.create({});
@@ -32,7 +32,7 @@ export const updateSettings = async (req, res) => {
     const { globalReturnMultiplier, manualWinnerEnabled } = req.body;
 
     let settings = await Settings.findOne();
-    
+
     if (!settings) {
       settings = await Settings.create({
         globalReturnMultiplier: globalReturnMultiplier || 10,
@@ -42,11 +42,11 @@ export const updateSettings = async (req, res) => {
       if (globalReturnMultiplier !== undefined) {
         settings.globalReturnMultiplier = globalReturnMultiplier;
       }
-      
+
       if (manualWinnerEnabled !== undefined) {
         settings.manualWinnerEnabled = manualWinnerEnabled;
       }
-      
+
       await settings.save();
     }
 
@@ -93,12 +93,32 @@ export const setManualWinner = async (req, res) => {
       });
     }
 
-    // Check if in manual winner window (50s to 57s)
-    const elapsedSec = Math.floor((Date.now() - new Date(round.startTime).getTime()) / 1000);
-    if (elapsedSec < 50 || elapsedSec >= 57) {
+    // 🔥 FIX: Use timer's internal elapsed time (not DB startTime)
+    // Import the getCurrentElapsedTime function from timerController
+    const { getCurrentElapsedTime } = await import("../controllers/timerController.js");
+    const timerState = getCurrentElapsedTime();
+    const elapsedSec = timerState.elapsedSeconds;
+    const visibleTimeLeft = timerState.visibleTimeLeft;
+
+    // Manual winner window: elapsed 50s-57s (visible time 10s-3s remaining)
+    if (elapsedSec < 50 || elapsedSec > 57) {
+      let errorMsg = "";
+      if (elapsedSec < 50) {
+        const waitSeconds = 50 - elapsedSec;
+        errorMsg = `Too early! You can set manual winner when visible time reaches 10s. Please wait ${waitSeconds}s more.`;
+      } else {
+        errorMsg = `Too late! Manual winner window has closed. Please wait for the next round.`;
+      }
+
       return res.status(400).json({
         success: false,
-        message: "Manual winner can only be set between 50-57 seconds of the round"
+        message: errorMsg,
+        details: {
+          currentVisibleTime: `${visibleTimeLeft}s`,
+          allowedWindow: "10s to 3s visible time",
+          status: elapsedSec < 50 ? "too_early" : "too_late",
+          nextOpportunity: elapsedSec < 50 ? `${50 - elapsedSec}s` : "Next round"
+        },
       });
     }
 
@@ -109,13 +129,13 @@ export const setManualWinner = async (req, res) => {
 
     console.log(`🔧 MANUAL WINNER SET: Round ${round.roundNumber}, Number: ${winningNumber}`);
 
-    // Emit event to all clients about manual winner set
+    // Emit event to all clients about manual winner confirmed
     const { emitToAll, isSocketReady } = await import("../config/socketConfig.js");
     if (isSocketReady()) {
-      emitToAll("manualWinnerSet", {
+      emitToAll("manualWinnerConfirmed", {
         roundNumber: round.roundNumber,
         winningNumber: winningNumber,
-        message: "Admin has set manual winner - Will be displayed shortly",
+        message: "Admin has set manual winner",
         timestamp: new Date().toISOString()
       });
     }
@@ -126,7 +146,8 @@ export const setManualWinner = async (req, res) => {
       data: {
         roundNumber: round.roundNumber,
         winningNumber: winningNumber,
-        timeRemaining: 68 - elapsedSec
+        elapsedSeconds: elapsedSec,
+        visibleTimeLeft: visibleTimeLeft
       }
     });
   } catch (err) {
@@ -142,7 +163,7 @@ export const setManualWinner = async (req, res) => {
 export const getReturnMultiplier = async (req, res) => {
   try {
     let settings = await Settings.findOne();
-    
+
     if (!settings) {
       settings = await Settings.create({});
     }

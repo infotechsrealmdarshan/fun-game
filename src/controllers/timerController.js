@@ -3,23 +3,36 @@ import Round from "../models/Round.js";
 import Bid from "../models/Bid.js";
 import User from "../models/User.js";
 import Settings from "../models/Settings.js";
-import { emitToAll, emitToUser, isSocketReady } from "../config/socketConfig.js"; // Added emitToUser
+import { emitToAll, emitToUser, isSocketReady } from "../config/socketConfig.js";
+import { getLastTenWinnersForSocket } from "../utils/winnerHelper.js";
 
+// ============================================================
+// STATE VARIABLES
+// ============================================================
 let currentRound = null;
-let phase = "bidding";
-let timeLeft = 68; // Start from 68s
 let timerRunning = false;
+let visibleInterval = null;
+let hiddenTimeout = null;
+let hiddenInterval = null;
+let visibleTimeLeft = 60; // 60 seconds visible to users
+let hiddenTimeLeft = 8;   // 8 seconds hidden internal cycle
 let winnerCalculated = false;
 let calculatedWinner = null;
 
-// EXACT TIMELINE - 68s TOTAL CYCLE
+// ============================================================
+// TIMELINE CONFIG
+// ============================================================
 const TIMELINE = {
-  TOTAL_ROUND_TIME: 68,      // 68 seconds total cycle
-  BIDDING_TIME: 57,          // 57 seconds bidding (68s to 11s)
-  WINNER_CALCULATION_TIME: 3, // 3 seconds calculate (11s to 8s)
-  SPIN_ANIMATION_TIME: 5,     // 5 seconds spin (8s to 3s) - ONLY FOR SPINNER
-  HOLD_TIME: 3,              // 3 seconds hold (3s to 0s)
-  MANUAL_WINNER_WINDOW: 7    // 7 seconds for manual winner (50s to 57s)
+  VISIBLE_TIME: 60,          // 60 seconds shown to users (bidding phase)
+  HIDDEN_TIME: 8,            // 8 seconds internal (after visible time ends)
+  TOTAL_CYCLE: 68,           // Total: 60 + 8 = 68 seconds
+  MANUAL_WINNER_WINDOW_START: 10,  // Manual winner window opens at 10s
+  MANUAL_WINNER_WINDOW_END: 3,     // Manual winner window closes at 3s (admin allowed until 3s)
+  MANUAL_PHASE_CHANGE_AT: 3,       // Emit phaseChange at visible 3s
+  VISIBLE_CALCULATE_WINNER_AT: 2,  // Calculate winner at visible 2s so winner ready by 0s
+  VISIBLE_PLAY_SPIN: 0,            // Play spin at visible 0s (end of bidding)
+  HIDDEN_ROUND_COMPLETE: 3,    // Hidden cycle: 3s -> process rewards + roundCompleted
+  HIDDEN_NEW_ROUND: 0           // Start new round at hidden 0s
 };
 
 /* ---------------------------------------------------
@@ -27,292 +40,421 @@ const TIMELINE = {
 ----------------------------------------------------*/
 export const startGameTimer = async () => {
   if (timerRunning) {
-    console.log("⚠️ Game timer already running");
+    console.log("⚠️ Timer already running");
     return;
   }
-  
-  timerRunning = true;
 
-  console.log("🎮 Game Timer Starting with 68s CYCLE...");
-  console.log("⏰ Timeline: 68s→50s:Bid → 50s→57s:ManualWinner → 57s:Close → 11s→8s:Calc → 8s:PlaySpin → 3s→0s:Hold");
+  timerRunning = true;
+  winnerCalculated = false;
+  calculatedWinner = null;
+
+  console.log("🎮 Starting Round Timer - 60s VISIBLE + 8s HIDDEN");
+  console.log("📊 Timeline: 60s Visible → 8s Hidden (Calc→Spin→Complete→NewRound)");
 
   try {
-    currentRound = await Round.findOne().sort({ roundNumber: -1 });
+    // Get or create current round
+    const lastRound = await Round.findOne().sort({ roundNumber: -1 });
 
-    if (!currentRound) {
+    if (!lastRound || lastRound.status === "completed") {
+      const nextRoundNum = lastRound ? lastRound.roundNumber + 1 : 1;
       currentRound = await Round.create({
-        roundNumber: 1,
-        roundId: "ROUND_1",
+        roundNumber: nextRoundNum,
+        roundId: `ROUND_${nextRoundNum}`,
         phase: "bidding",
         status: "running",
         startTime: new Date()
       });
-      console.log("✅ Created first round:", currentRound.roundNumber);
-    } else if (currentRound.status === "completed") {
-      const next = currentRound.roundNumber + 1;
-      currentRound = await Round.create({
-        roundNumber: next,
-        roundId: `ROUND_${next}`,
-        phase: "bidding",
-        status: "running",
-        startTime: new Date()
-      });
-      console.log("✅ Created new round:", currentRound.roundNumber);
+      console.log(`✅ Created new round: ${currentRound.roundNumber}`);
     } else {
-      phase = currentRound.phase || "bidding";
-      console.log("✅ Resumed existing round:", currentRound.roundNumber);
+      currentRound = lastRound;
+      console.log(`✅ Resumed existing round: ${currentRound.roundNumber}`);
     }
 
-    timeLeft = TIMELINE.TOTAL_ROUND_TIME;
-    winnerCalculated = false;
-    calculatedWinner = null;
+    // Reset timers
+    visibleTimeLeft = TIMELINE.VISIBLE_TIME;
+    hiddenTimeLeft = TIMELINE.HIDDEN_TIME;
 
-    console.log(`⏰ Starting timer: Round ${currentRound.roundNumber}, TimeLeft: ${timeLeft}s`);
-    
-    // Start the tick function
-    tick();
+    // Start the visible 60-second cycle
+    startVisibleCycle();
 
   } catch (err) {
-    console.error("❌ Error starting game timer:", err);
+    console.error("❌ Error starting round timer:", err);
     timerRunning = false;
   }
 };
 
-/* ---------------------------------------------------
-   TICK FUNCTION - UPDATED WITH MANUAL WINNER WINDOW
-----------------------------------------------------*/
-const tick = async () => {
-  try {
-    if (!timerRunning) return;
+/* ============================================================
+   VISIBLE CYCLE: 60 seconds (what users see)
+============================================================*/
+const startVisibleCycle = () => {
+  console.log(`⏱️ VISIBLE CYCLE START: 60s countdown`);
 
-    let displayPhase = phase;
-    let displayStatus = "running";
-    let displayWinningNumber = null;
-    
-    // 1. BIDDING PHASE (68s to 11s) - 57 seconds
-    if (timeLeft > (TIMELINE.TOTAL_ROUND_TIME - TIMELINE.BIDDING_TIME)) {
-      displayPhase = "bidding";
-      displayStatus = "running";
-      
-      // 🔥 FIXED: Manual Winner Window - Emit only once at 50s
-      if (timeLeft === (TIMELINE.TOTAL_ROUND_TIME - 50)) {
-        if (isSocketReady() && currentRound) {
-          emitToAll("manualWinnerWindow", {
-            roundNumber: currentRound.roundNumber,
-            message: "Manual winner window open (50s-57s) - Admin can set winner",
-            windowOpen: true,
-            timeLeft: timeLeft,
-            timeRemaining: 7, // Fixed 7 seconds window
-            timestamp: new Date().toISOString()
-          });
-          console.log(`🔧 MANUAL WINNER WINDOW OPEN: Round ${currentRound.roundNumber}, 50s-57s`);
+  visibleInterval = setInterval(async () => {
+    try {
+      // ✅ FIXED: Determine current phase dynamically
+      let currentPhase = "bidding";
+      let biddingLocked = false;
+
+      if (visibleTimeLeft <= TIMELINE.MANUAL_PHASE_CHANGE_AT) {
+        currentPhase = "hold";
+        biddingLocked = true;
+      }
+
+      // Update round in database with current phase and lock status
+      if (currentRound && currentRound._id) {
+        try {
+          // Update only if phase has changed
+          if (currentRound.phase !== currentPhase || currentRound.biddingLocked !== biddingLocked) {
+            currentRound.phase = currentPhase;
+            currentRound.biddingLocked = biddingLocked;
+            await currentRound.save();
+            console.log(`📝 Updated round ${currentRound.roundNumber}: phase=${currentPhase}, biddingLocked=${biddingLocked}`);
+          }
+        } catch (err) {
+          console.error("❌ Error saving round update:", err);
         }
       }
-    }
-    // 2. CALCULATE WINNER (at exactly 11s remaining)
-    else if (timeLeft === (TIMELINE.TOTAL_ROUND_TIME - TIMELINE.BIDDING_TIME)) {
-      displayPhase = "calculating";
-      displayStatus = "calculating";
-      
+
+      // Emit timerUpdate ONLY during visible time
       if (isSocketReady()) {
-        emitToAll("phaseChange", {
+        emitToAll("timerUpdate", {
           roundNumber: currentRound?.roundNumber || 0,
-          phase: "calculating",
-          message: "Bidding stopped - Calculating winner",
+          phase: currentPhase,  // ✅ Use dynamic phase
+          timeLeft: visibleTimeLeft,
+          status: "running",
+          totalCycle: TIMELINE.TOTAL_CYCLE,
+          visibleTime: TIMELINE.VISIBLE_TIME,
           timestamp: new Date().toISOString()
         });
-        console.log(`🔄 EMITTED phaseChange: calculating (Bidding STOPPED)`);
       }
-      
-      await calculateWinnerImmediately();
-    }
-    // 3. During winner calculation (11s to 8s remaining)
-    else if (timeLeft > (TIMELINE.TOTAL_ROUND_TIME - TIMELINE.BIDDING_TIME - TIMELINE.WINNER_CALCULATION_TIME)) {
-      displayPhase = "calculating";
-      displayStatus = "calculating";
-    }
-    // 4. PLAY SPIN PHASE (at exactly 8s remaining)
-    else if (timeLeft === (TIMELINE.TOTAL_ROUND_TIME - TIMELINE.BIDDING_TIME - TIMELINE.WINNER_CALCULATION_TIME)) {
-      displayPhase = "playSpin";
-      displayStatus = "playSpin";
-      await triggerPlaySpinPhase();
-    }
-    // 5. During spin animation (8s to 3s remaining)
-    else if (timeLeft > TIMELINE.HOLD_TIME) {
-      displayPhase = "playSpin";
-      displayStatus = "playSpin";
-      
-      // 🔥 FIX: Show winning number during playSpin phase if calculated
-      if (calculatedWinner) {
-        displayWinningNumber = calculatedWinner.storedWinningNumber === 10 ? 0 : calculatedWinner.storedWinningNumber;
+
+      // Manual winner window: 10s to 3s (emit once at window start)
+      if (visibleTimeLeft === TIMELINE.MANUAL_WINNER_WINDOW_START) {
+        if (isSocketReady()) {
+          const duration = TIMELINE.MANUAL_WINNER_WINDOW_START - TIMELINE.MANUAL_WINNER_WINDOW_END + 1;
+          emitToAll("manualWinnerWindow", {
+            roundNumber: currentRound?.roundNumber || 0,
+            message: `Manual winner window open (${TIMELINE.MANUAL_WINNER_WINDOW_START}s - ${TIMELINE.MANUAL_WINNER_WINDOW_END}s) - Admin can set winner`,
+            windowOpen: true,
+            timeLeft: visibleTimeLeft,
+            duration,
+            timestamp: new Date().toISOString()
+          });
+          console.log(`🔧 Manual Winner Window OPEN at ${TIMELINE.MANUAL_WINNER_WINDOW_START}s for ${duration}s`);
+        }
       }
-    }
-    // 6. HOLD PHASE (at exactly 3s remaining)
-    else if (timeLeft === TIMELINE.HOLD_TIME) {
-      displayPhase = "hold";
-      displayStatus = "hold";
-      await triggerRoundCompleteAndHold();
-    }
-    // 7. During hold phase (3s to 0s remaining)
-    else if (timeLeft > 0) {
-      displayPhase = "hold";
-      displayStatus = "hold";
-      
-      // 🔥 FIX: Show winning number during hold phase
-      if (calculatedWinner) {
-        displayWinningNumber = calculatedWinner.storedWinningNumber === 10 ? 0 : calculatedWinner.storedWinningNumber;
+
+      // At visible 3s (57s elapsed): additionally emit phaseChange event
+      if (visibleTimeLeft === TIMELINE.MANUAL_PHASE_CHANGE_AT) {
+        try {
+          console.log(`🔄 Phase transition: bidding → hold (Round ${currentRound?.roundNumber})`);
+
+          if (isSocketReady()) {
+            // 🔥 Include winningNumber in phaseChange if already calculated
+            const phaseChangeData = {
+              roundNumber: currentRound?.roundNumber || 0,
+              phase: "hold",
+              previousPhase: "bidding",
+              message: "Pausing bidding - moving to hold (57s elapsed)",
+              timestamp: new Date().toISOString()
+            };
+
+            // If winner is already calculated, include it in the event
+            if (winnerCalculated && calculatedWinner) {
+              const winningNumber = calculatedWinner.storedWinningNumber === 10 ? 0 : calculatedWinner.storedWinningNumber;
+              phaseChangeData.winningNumber = winningNumber;
+              phaseChangeData.isManualWinner = currentRound.isManualWinner || false;
+              console.log(`📍 Included winner in phaseChange: ${winningNumber}`);
+            }
+
+            emitToAll("phaseChange", phaseChangeData);
+          }
+
+          console.log(`🔒 Bidding locked for Round ${currentRound.roundNumber}`);
+        } catch (err) {
+          console.error("❌ Error setting phaseChange at 57s:", err);
+        }
       }
+
+      // At visible 2s: calculate winner so result is ready before 0s
+      if (visibleTimeLeft === TIMELINE.VISIBLE_CALCULATE_WINNER_AT) {
+        try {
+          console.log(`🎯 Visible 2s → Pre-calculating winner`);
+          if (!winnerCalculated) {
+            await calculateWinnerImmediately();
+          }
+        } catch (err) {
+          console.error("❌ Error pre-calculating winner at visible 2s:", err);
+        }
+      }
+
+      // At visible 0s: Emit playSpin using pre-calculated winner (or calculate if missing)
+      if (visibleTimeLeft === TIMELINE.VISIBLE_PLAY_SPIN) {
+        console.log(`🎰 Visible 0s → Emitting playSpin with prepared winner`);
+        if (!winnerCalculated) {
+          await calculateWinnerImmediately();
+        }
+        await triggerPlaySpinWithWinner();
+      }
+
+      visibleTimeLeft--;
+
+      // When visible time reaches 0, transition to hidden cycle
+      if (visibleTimeLeft < 0) {
+        clearInterval(visibleInterval);
+        console.log(`✅ VISIBLE CYCLE COMPLETE - Starting HIDDEN CYCLE`);
+        startHiddenCycle();
+      }
+    } catch (err) {
+      console.error("❌ Error in visible cycle:", err);
     }
-    // 8. END CYCLE & START NEW ROUND (at 0s)
-    else if (timeLeft === 0) {
-      await startNewRound();
+  }, 1000);
+};
+
+/* ============================================================
+   HIDDEN CYCLE: 8 seconds (NO timerUpdate, only internal events)
+============================================================*/
+const startHiddenCycle = () => {
+  console.log(`🔒 HIDDEN CYCLE START: 8s internal countdown`);
+
+  hiddenTimeLeft = TIMELINE.HIDDEN_TIME;
+
+  hiddenInterval = setInterval(async () => {
+    try {
+      // At hiddenLeft = 3: Process rewards and complete round (do not re-emit playSpin)
+      if (hiddenTimeLeft === TIMELINE.HIDDEN_ROUND_COMPLETE) {
+        console.log(`🎯 Hidden ${TIMELINE.HIDDEN_ROUND_COMPLETE}s → Processing rewards & Completing round`);
+
+        if (!winnerCalculated) {
+          await calculateWinnerImmediately();
+        }
+
+        // Process rewards (uses calculatedWinner)
+        if (calculatedWinner) {
+          await processRoundRewards(calculatedWinner);
+        }
+
+        // Complete round
+        await triggerRoundCompleted();
+      }
+
+      hiddenTimeLeft--;
+
+      // At hiddenLeft = 0: Start new round
+      if (hiddenTimeLeft < 0) {
+        clearInterval(hiddenInterval);
+        console.log(`✅ HIDDEN CYCLE COMPLETE → Starting NEW ROUND`);
+        await startNewRound();
+      }
+    } catch (err) {
+      console.error("❌ Error in hidden cycle:", err);
+    }
+  }, 1000);
+};
+
+/* ============================================================
+   CALCULATE WINNER IMMEDIATELY (hidden 8s mark)
+============================================================*/
+const calculateWinnerImmediately = async () => {
+  try {
+    if (winnerCalculated) {
+      console.log("⚠️ Winner already calculated");
       return;
     }
 
-    // Send timer update via Socket.IO
-    const timerData = {
-      roundNumber: currentRound?.roundNumber || 0,
-      phase: displayPhase,
-      timeLeft: timeLeft,
-      status: displayStatus,
-      winningNumber: displayWinningNumber, // 🔥 Use the properly set winning number
-      timeline: TIMELINE,
-      timestamp: new Date().toISOString()
-    };
-    
-    // Emit timer update
-    if (isSocketReady()) {
-      emitToAll("timerUpdate", timerData);
-      
-      // Debug logging for manual winner
-      if (currentRound?.isManualWinner && displayWinningNumber !== null) {
-        console.log(`🎯 MANUAL WINNER DISPLAYED: ${displayWinningNumber}, TimeLeft: ${timeLeft}s`);
-      }
-    }
-
-    // Continue to next second
-    timeLeft -= 1;
-    setTimeout(tick, 1000);
-
-  } catch (err) {
-    console.error("🔥 Critical error in tick function:", err);
-    timeLeft = Math.max(0, timeLeft - 1);
-    setTimeout(tick, 1000);
-  }
-};
-
-/* ---------------------------------------------------
-   CALCULATE WINNER IMMEDIATELY (at 11s) - UPDATED WITH MANUAL WINNER LOGGING
-----------------------------------------------------*/
-const calculateWinnerImmediately = async () => {
-  try {
-    console.log("🎯 Calculating winner @11s (bidding closed)");
-    
-    phase = "calculating";
-    
     const winnerData = await calculateWinner(currentRound._id);
     calculatedWinner = winnerData;
     winnerCalculated = true;
 
     currentRound.calculatedWinningNumber = winnerData.storedWinningNumber;
     await currentRound.save();
-    
-    // 🔥 IMPROVED LOGGING
+
+    // Log result
     if (currentRound.isManualWinner && currentRound.manualWinner) {
       const manualWinNum = currentRound.manualWinner === 10 ? 0 : currentRound.manualWinner;
-      console.log(`✅ MANUAL WINNER USED: ${manualWinNum} (set by admin)`);
-      
-      // Emit manual winner confirmation
+      console.log(`✅ MANUAL WINNER: ${manualWinNum} (set by admin)`);
+
       if (isSocketReady()) {
         emitToAll("manualWinnerConfirmed", {
           roundNumber: currentRound.roundNumber,
           winningNumber: manualWinNum,
-          message: "Manual winner confirmed and will be displayed",
+          message: "Manual winner confirmed",
           timestamp: new Date().toISOString()
         });
       }
     } else {
-      console.log(`✅ AUTOMATIC WINNER CALCULATED: ${winnerData.winningNumber}`);
+      console.log(`✅ AUTOMATIC WINNER: ${winnerData.winningNumber}`);
     }
-    
   } catch (error) {
     console.error("❌ Error calculating winner:", error);
   }
 };
 
-/* ---------------------------------------------------
-   TRIGGER PLAY SPIN PHASE (at 8s) - UPDATED WITH MANUAL WINNER INFO
-----------------------------------------------------*/
-const triggerPlaySpinPhase = async () => {
+/* ============================================================
+   TRIGGER PLAY SPIN (hidden 5s mark)
+============================================================*/
+const triggerPlaySpin = async () => {
   try {
-    phase = "playSpin";
-    
-    if (isSocketReady() && calculatedWinner) {
+    if (!calculatedWinner) {
+      console.log("⚠️ No winner calculated yet");
+      return;
+    }
+
+    if (isSocketReady()) {
       const winningNumber = calculatedWinner.storedWinningNumber === 10 ? 0 : calculatedWinner.storedWinningNumber;
       const isManualWinner = currentRound.isManualWinner || false;
-      
-      // Emit playSpin event with winner number and manual flag
+
       emitToAll("playSpin", {
         roundNumber: currentRound?.roundNumber || 0,
         phase: "playSpin",
-        timeLeft: TIMELINE.SPIN_ANIMATION_TIME, // 5 seconds for spinner
         status: "playSpin",
         winningNumber: winningNumber,
-        isManualWinner: isManualWinner, // 🔥 NEW: Indicates if winner was manually set
-        message: isManualWinner 
-          ? "Manual winner set by admin - Play spin animation" 
+        isManualWinner: isManualWinner,
+        message: isManualWinner
+          ? "Manual winner - Play spin animation"
           : "Automatic winner - Play spin animation",
         timestamp: new Date().toISOString()
       });
-      console.log(`🎰 EMITTED playSpin: Round ${currentRound?.roundNumber}, Winner: ${winningNumber}, Manual: ${isManualWinner}`);
+      console.log(`🎰 EMITTED playSpin: Winner ${winningNumber}`);
     }
   } catch (error) {
-    console.error("❌ Error triggering play spin phase:", error);
+    console.error("❌ Error triggering play spin:", error);
   }
 };
 
-/* ---------------------------------------------------
-   TRIGGER ROUND COMPLETE & HOLD (at 3s) - UPDATED WITH MANUAL WINNER INFO
-----------------------------------------------------*/
-const triggerRoundCompleteAndHold = async () => {
+/* ============================================================
+   TRIGGER PLAY SPIN WITH WINNER (hidden 3s mark)
+   Emits playSpin event with winner information attached
+============================================================*/
+const triggerPlaySpinWithWinner = async () => {
   try {
-    phase = "hold";
-    
-    // Process rewards and complete round
-    if (currentRound && calculatedWinner) {
-      await processRoundRewards(calculatedWinner);
-      
-      currentRound.status = "completed";
-      currentRound.winningNumber = calculatedWinner.winningNumber === 0 ? 10 : calculatedWinner.winningNumber;
-      currentRound.endTime = new Date();
-      currentRound.phase = "completed";
-      await currentRound.save();
-      
-      console.log(`✅ Round ${currentRound.roundNumber} completed. Winner: ${calculatedWinner.winningNumber}`);
+    if (!calculatedWinner) {
+      console.log("⚠️ No winner calculated yet");
+      return;
     }
-    
-    // Emit completion events
-    if (isSocketReady() && calculatedWinner) {
+
+    if (isSocketReady()) {
       const winningNumber = calculatedWinner.storedWinningNumber === 10 ? 0 : calculatedWinner.storedWinningNumber;
       const isManualWinner = currentRound.isManualWinner || false;
-      
+
+      emitToAll("playSpin", {
+        roundNumber: currentRound?.roundNumber || 0,
+        phase: "playSpin",
+        status: "playSpin",
+        winningNumber: winningNumber,
+        isManualWinner: isManualWinner,
+        winnerInfo: {
+          winningNumber: winningNumber,
+          winnerCount: calculatedWinner.bids.filter(b => {
+            const v = b.bidNumber == 10 ? 0 : Number(b.bidNumber);
+            return v === winningNumber;
+          }).length,
+          totalBids: calculatedWinner.bids.length,
+          isManualWinner: isManualWinner
+        },
+        message: isManualWinner
+          ? "Manual winner set - Play spin animation with winner"
+          : "Winner calculated - Play spin animation with winner",
+        timestamp: new Date().toISOString()
+      });
+      console.log(`🎰 EMITTED playSpin WITH WINNER: ${winningNumber} (Hidden 3s)`);
+    }
+  } catch (error) {
+    console.error("❌ Error triggering play spin with winner:", error);
+  }
+};
+
+/* ============================================================
+   TRIGGER ROUND COMPLETED (hidden 3s mark)
+============================================================*/
+const triggerRoundCompleted = async () => {
+  try {
+    if (!currentRound || !calculatedWinner) {
+      console.log("⚠️ Cannot complete round - missing data");
+      return;
+    }
+
+    currentRound.status = "completed";
+    currentRound.winningNumber = calculatedWinner.winningNumber === 0 ? 10 : calculatedWinner.winningNumber;
+    currentRound.endTime = new Date();
+    currentRound.phase = "completed";
+    await currentRound.save();
+
+    if (isSocketReady()) {
+      const winningNumber = calculatedWinner.storedWinningNumber === 10 ? 0 : calculatedWinner.storedWinningNumber;
+      const isManualWinner = currentRound.isManualWinner || false;
+
       emitToAll("roundCompleted", {
         roundNumber: currentRound?.roundNumber || 0,
         winningNumber: winningNumber,
-        isManualWinner: isManualWinner, // 🔥 NEW: Manual winner flag
-        phase: "completed", 
+        isManualWinner: isManualWinner,
+        phase: "completed",
         status: "completed",
-        message: isManualWinner 
-          ? "Round completed with manual winner" 
+        message: isManualWinner
+          ? "Round completed with manual winner"
           : "Round completed with automatic winner",
         timestamp: new Date().toISOString()
       });
-      
-      console.log(`🏁 EMITTED roundCompleted : Winner ${winningNumber}, Manual: ${isManualWinner}`);
+      console.log(`🏁 EMITTED roundCompleted: Winner ${winningNumber}`);
     }
-    
   } catch (error) {
-    console.error("❌ Error triggering round complete:", error);
+    console.error("❌ Error in round completed:", error);
+  }
+};
+
+/* ============================================================
+   START NEW ROUND (hidden 0s mark)
+============================================================*/
+// In timerController.js - startNewRound function
+const startNewRound = async () => {
+  try {
+    // Stop all current timers
+    if (visibleInterval) clearInterval(visibleInterval);
+    if (hiddenInterval) clearInterval(hiddenInterval);
+    if (hiddenTimeout) clearTimeout(hiddenTimeout);
+
+    const nextRoundNumber = currentRound ? currentRound.roundNumber + 1 : 1;
+
+    // Create new round with bidding enabled
+    currentRound = await Round.create({
+      roundNumber: nextRoundNumber,
+      roundId: `ROUND_${nextRoundNumber}`,
+      phase: "bidding",
+      status: "running",
+      biddingLocked: false, // ✅ Ensure bidding is NOT locked for new round
+      isManualWinner: false, // ✅ Reset manual winner flag
+      manualWinner: null, // ✅ Clear manual winner
+      startTime: new Date()
+    });
+
+    visibleTimeLeft = TIMELINE.VISIBLE_TIME;
+    hiddenTimeLeft = TIMELINE.HIDDEN_TIME;
+    winnerCalculated = false;
+    calculatedWinner = null;
+
+    console.log(`🔄 NEW ROUND STARTED: #${currentRound.roundNumber}, phase=bidding, biddingLocked=false`);
+
+    if (isSocketReady()) {
+      // Get last 10 winners for new round event
+      const winnersData = await getLastTenWinnersForSocket();
+      
+      emitToAll("newRound", {
+        roundNumber: currentRound.roundNumber,
+        phase: "bidding",
+        status: "running",
+        timeLeft: TIMELINE.VISIBLE_TIME,
+        lastTenWinners: winnersData.lastTenWinners, // 🔥 Added last 10 winners array
+        lastTenWinnersString: winnersData.lastTenWinnersString, // 🔥 Added comma-separated string
+        timestamp: new Date().toISOString()
+      });
+      console.log(`📡 EMITTED newRound: #${currentRound.roundNumber} with last 10 winners`);
+    }
+
+    // Restart the visible cycle
+    startVisibleCycle();
+  } catch (error) {
+    console.error("❌ Error starting new round:", error);
+    setTimeout(() => startNewRound(), 3000);
   }
 };
 
@@ -348,8 +490,8 @@ const processRoundRewards = async (winnerData) => {
 
       // 🔥 ATTACH MANUAL WINNER INFO TO THE WINNING BID
       await Bid.findByIdAndUpdate(winnerBidId, {
-        $set: { 
-          result: "win", 
+        $set: {
+          result: "win",
           reward: reward,
           isManualWinner: isManual || false // 🔥 Store if this was a manual win
         }
@@ -359,8 +501,8 @@ const processRoundRewards = async (winnerData) => {
       if (isSocketReady() && winnerUser) {
         emitToUser(winnerUserId.toString(), "balanceUpdate", {
           success: true,
-          message: isManual 
-            ? "Congratulations! You won with manual selection!" 
+          message: isManual
+            ? "Congratulations! You won with manual selection!"
             : "Congratulations! You won the round!",
           data: {
             coins: winnerUser.coins,
@@ -396,8 +538,8 @@ const processRoundRewards = async (winnerData) => {
     if (losers.length) {
       await Bid.updateMany(
         { _id: { $in: losers } },
-        { 
-          result: "lose", 
+        {
+          result: "lose",
           reward: 0,
           isManualWinner: false // 🔥 Losers are not manual winners
         }
@@ -425,7 +567,7 @@ const processRoundRewards = async (winnerData) => {
     }
 
     console.log(`💰 ${isManual ? 'MANUAL ' : ''}Rewards processed for Round ${currentRound?.roundNumber}`);
-    
+
   } catch (error) {
     console.error("❌ Error processing rewards:", error);
   }
@@ -501,51 +643,10 @@ const calculateWinner = async (roundId) => {
   }
 };
 
-/* ---------------------------------------------------
-   START NEW ROUND (at 0s)
-----------------------------------------------------*/
-const startNewRound = async () => {
-  try {
-    const nextRoundNumber = currentRound ? currentRound.roundNumber + 1 : 1;
-    
-    currentRound = await Round.create({
-      roundNumber: nextRoundNumber,
-      roundId: `ROUND_${nextRoundNumber}`,
-      phase: "bidding",
-      status: "running",
-      startTime: new Date()
-    });
 
-    timeLeft = TIMELINE.TOTAL_ROUND_TIME;
-    phase = "bidding";
-    winnerCalculated = false;
-    calculatedWinner = null;
-
-    console.log(`🔄 New Round Started: #${currentRound.roundNumber}, TimeLeft: ${timeLeft}s`);
-
-    // Emit new round event
-    emitToAll("newRound", {
-      roundNumber: currentRound.roundNumber,
-      timeLeft: TIMELINE.TOTAL_ROUND_TIME,
-      phase: "bidding",
-      status: "running",
-      timeline: TIMELINE,
-      timestamp: new Date().toISOString()
-    });
-    console.log(`🔄 EMITTED newRound: #${currentRound.roundNumber}`);
-
-    // Continue ticking
-    setTimeout(tick, 1000);
-
-  } catch (error) {
-    console.error("❌ Error starting new round:", error);
-    setTimeout(startNewRound, 3000);
-  }
-};
-
-/* ---------------------------------------------------
+/* ============================================================
    GET CURRENT TIMER STATUS
-----------------------------------------------------*/
+============================================================*/
 export const getTimerStatus = () => {
   return {
     timerRunning,
@@ -556,11 +657,45 @@ export const getTimerStatus = () => {
       isManualWinner: currentRound.isManualWinner || false,
       manualWinner: currentRound.manualWinner
     } : null,
-    timeLeft,
-    phase,
+    visibleTimeLeft,
+    hiddenTimeLeft,
     winnerCalculated,
     timeline: TIMELINE
   };
 };
 
 export const getTimeline = () => TIMELINE;
+
+/* ============================================================
+   GET CURRENT ELAPSED TIME (during visible cycle)
+   Returns elapsed seconds from timer state (not from DB)
+============================================================*/
+export const getCurrentElapsedTime = () => {
+  // During visible cycle: elapsed = VISIBLE_TIME - visibleTimeLeft
+  const elapsedDuringVisible = TIMELINE.VISIBLE_TIME - visibleTimeLeft;
+  return {
+    elapsedSeconds: elapsedDuringVisible,
+    visibleTimeLeft: visibleTimeLeft,
+    inHiddenCycle: visibleTimeLeft < 0,
+    hiddenTimeLeft: visibleTimeLeft < 0 ? hiddenTimeLeft : null
+  };
+};
+
+/* ============================================================
+   STOP TIMER (cleanup)
+============================================================*/
+export const stopTimer = () => {
+  if (visibleInterval) clearInterval(visibleInterval);
+  if (hiddenInterval) clearInterval(hiddenInterval);
+  if (hiddenTimeout) clearTimeout(hiddenTimeout);
+  timerRunning = false;
+  console.log("⛔ Timer stopped");
+};
+
+/* ============================================================
+   RESTART TIMER
+============================================================*/
+export const restartTimer = async () => {
+  stopTimer();
+  await startRoundTimer();
+};

@@ -12,7 +12,4 @@ const bidSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// ✅ Ensure one bid per user per round
-bidSchema.index({ roundId: 1, userId: 1 }, { unique: true });
-
 export default mongoose.model("Bid", bidSchema);
