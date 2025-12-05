@@ -18,6 +18,7 @@ let visibleTimeLeft = 60; // 60 seconds visible to users
 let hiddenTimeLeft = 8;   // 8 seconds hidden internal cycle
 let winnerCalculated = false;
 let calculatedWinner = null;
+let lastEmittedVisible = null; // guard to prevent duplicate emits for same timeLeft
 
 // ============================================================
 // TIMELINE CONFIG
@@ -87,6 +88,14 @@ export const startGameTimer = async () => {
    VISIBLE CYCLE: 60 seconds (what users see)
 ============================================================*/
 const startVisibleCycle = () => {
+  // Clear any existing visible interval to avoid duplicate intervals
+  if (visibleInterval) {
+    clearInterval(visibleInterval);
+  }
+
+  // Reset last emitted guard so the new cycle starts clean
+  lastEmittedVisible = null;
+
   console.log(`⏱️ VISIBLE CYCLE START: 60s countdown`);
 
   visibleInterval = setInterval(async () => {
@@ -117,15 +126,21 @@ const startVisibleCycle = () => {
 
       // Emit timerUpdate ONLY during visible time
       if (isSocketReady()) {
-        emitToAll("timerUpdate", {
-          roundNumber: currentRound?.roundNumber || 0,
-          phase: currentPhase,  // ✅ Use dynamic phase
-          timeLeft: visibleTimeLeft,
-          status: "running",
-          totalCycle: TIMELINE.TOTAL_CYCLE,
-          visibleTime: TIMELINE.VISIBLE_TIME,
-          timestamp: new Date().toISOString()
-        });
+        // Prevent emitting the same `timeLeft` more than once (duplicates seen as 3,2,2,0)
+        if (lastEmittedVisible !== visibleTimeLeft) {
+          emitToAll("timerUpdate", {
+            roundNumber: currentRound?.roundNumber || 0,
+            phase: currentPhase,  // ✅ Use dynamic phase
+            timeLeft: visibleTimeLeft,
+            status: "running",
+            totalCycle: TIMELINE.TOTAL_CYCLE,
+            visibleTime: TIMELINE.VISIBLE_TIME,
+            timestamp: new Date().toISOString()
+          });
+          lastEmittedVisible = visibleTimeLeft;
+        } else {
+          // Skip duplicate emit for same timeLeft
+        }
       }
 
       // Manual winner window: 10s to 3s (emit once at window start)
