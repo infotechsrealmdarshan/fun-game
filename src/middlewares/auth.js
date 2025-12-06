@@ -20,6 +20,11 @@ const auth = async (req, res, next) => {
     if (!user)
       return successResponse(res, "User not found", null, null, 200, 0);
 
+    // Block access for soft-deleted accounts
+    if (user.isDeleted) {
+      return errorResponse(res, "Your account is deleted. Please contact support team.", 403);
+    }
+
     req.user = {
       id: user._id,
       email: user.email,
@@ -41,6 +46,11 @@ const auth = async (req, res, next) => {
 
         const user = await User.findById(refreshDecoded.id);
         if (!user) return errorResponse(res, "User not found", 404);
+
+        // Block access for soft-deleted accounts on refresh
+        if (user.isDeleted) {
+          return errorResponse(res, "Your account is deleted. Please contact support team.", 403);
+        }
 
         const newAccess = authHelper.generateAccessToken(user);
         res.setHeader("x-new-access-token", newAccess);

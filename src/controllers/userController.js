@@ -88,6 +88,11 @@ export const loginUser = async (req, res) => {
     if (!user)
       return successResponse(res, "User not found", null, null, 200, 0);
 
+    // Reject login if account is soft-deleted
+    if (user.isDeleted) {
+      return errorResponse(res, "Your account is deleted. Please contact support team.", 403);
+    }
+
     const valid = await bcrypt.compare(password, user.password);
     if (!valid)
       return successResponse(res, "Invalid credentials", null, null, 200, 0);
@@ -157,14 +162,44 @@ export const getUserById = async (req, res) => {
 /* ---------------- Admin: Delete User ---------------- */
 export const deleteUserById = async (req, res) => {
   try {
-    const user = await User.findByIdAndDelete(req.params.id);
+    // Soft-delete admin action: set isDeleted = true
+    const user = await User.findByIdAndUpdate(req.params.id, { isDeleted: true }, { new: true });
     if (!user)
       return successResponse(res, "User not found", null, null, 200, 0);
 
+    // Remove stored refresh token so account cannot refresh
     await redisClient.del(`refreshToken:${req.params.id}`);
 
-    return successResponse(res, "User deleted successfully", null, null, 200, 1);
+    return successResponse(res, "User soft-deleted successfully", null, null, 200, 1);
   } catch (err) {
+    return errorResponse(res, err.message || "Server error", 500);
+  }
+};
+
+/* ---------------- User: Soft Delete Own Account ---------------- */
+export const deleteMyAccount = async (req, res) => {
+  try {
+    const userId = req.user?.id || req.user?._id;
+    if (!userId) return errorResponse(res, "Unauthorized", 401);
+
+    const user = await User.findByIdAndUpdate(userId, { isDeleted: true }, { new: true });
+    if (!user) return successResponse(res, "User not found", null, null, 200, 0);
+
+    // Invalidate refresh token
+    await redisClient.del(`refreshToken:${userId}`);
+
+    // Optionally emit socket event to notify client (they will be logged out client-side)
+    if (isSocketReady()) {
+      emitToUser(userId.toString(), "accountDeleted", {
+        success: true,
+        message: "Your account has been deleted. Contact support for assistance.",
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    return successResponse(res, "Account deleted successfully", null, null, 200, 1);
+  } catch (err) {
+    console.error("deleteMyAccount error:", err);
     return errorResponse(res, err.message || "Server error", 500);
   }
 };

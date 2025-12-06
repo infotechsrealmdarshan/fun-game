@@ -7,6 +7,7 @@ import {
   getAllUsers,
   getUserById,
   deleteUserById,
+  deleteMyAccount,
   refreshAccessToken,
   claimWinnings,
   getWinningBalance,
@@ -220,6 +221,22 @@ router.post("/claim-winnings", auth, claimWinnings);
  *         description: Internal server error
  */
 router.get("/winning-balance", auth, getWinningBalance);
+
+/**
+ * @swagger
+ * /api/users/me:
+ *   delete:
+ *     summary: Soft delete own account
+ *     tags: [Users]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Account deleted successfully
+ *       401:
+ *         description: Unauthorized
+ */
+router.delete("/me", auth, deleteMyAccount);
 
 
 export default router;

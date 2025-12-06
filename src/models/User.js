@@ -7,6 +7,7 @@ const userSchema = new mongoose.Schema(
     email: { type: String, required: true, unique: true },
     password: { type: String, required: true },
     mobile: { type: String, required: true },
+    isDeleted: { type: Boolean, default: false },
     coins: { type: Number, default: 1000 },            
     pendingWinningCoins: { type: Number, default: 0 }, 
     totalSection: { type: Number, default: 0 },
