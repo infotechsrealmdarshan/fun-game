@@ -19,6 +19,8 @@ let hiddenTimeLeft = 8;   // 8 seconds hidden internal cycle
 let winnerCalculated = false;
 let calculatedWinner = null;
 let lastEmittedVisible = null; // guard to prevent duplicate emits for same timeLeft
+let visibleTickRunning = false; // prevent overlapping visible interval callbacks
+let hiddenTickRunning = false;  // prevent overlapping hidden interval callbacks
 
 // ============================================================
 // TIMELINE CONFIG
@@ -102,6 +104,8 @@ const startVisibleCycle = () => {
   console.log(`⏱️ VISIBLE CYCLE START: counting ${TIMELINE.VISIBLE_TIME - 1} → 0 (${TIMELINE.VISIBLE_TIME} ticks)`);
 
   visibleInterval = setInterval(async () => {
+    if (visibleTickRunning) return; // skip this tick if the previous is still running
+    visibleTickRunning = true;
     try {
       // ✅ FIXED: Determine current phase dynamically
       let currentPhase = "bidding";
@@ -225,6 +229,8 @@ const startVisibleCycle = () => {
       }
     } catch (err) {
       console.error("❌ Error in visible cycle:", err);
+    } finally {
+      visibleTickRunning = false;
     }
   }, 1000);
 };
@@ -238,6 +244,8 @@ const startHiddenCycle = () => {
   hiddenTimeLeft = TIMELINE.HIDDEN_TIME;
 
   hiddenInterval = setInterval(async () => {
+    if (hiddenTickRunning) return; // skip if previous hidden tick still running
+    hiddenTickRunning = true;
     try {
       // At hiddenLeft = 3: Process rewards and complete round (do not re-emit playSpin)
       if (hiddenTimeLeft === TIMELINE.HIDDEN_ROUND_COMPLETE) {
@@ -266,6 +274,8 @@ const startHiddenCycle = () => {
       }
     } catch (err) {
       console.error("❌ Error in hidden cycle:", err);
+    } finally {
+      hiddenTickRunning = false;
     }
   }, 1000);
 };
