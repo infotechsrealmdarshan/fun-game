@@ -482,7 +482,7 @@ const startNewRound = async () => {
     if (isSocketReady()) {
       // Get last 10 winners for new round event
       const winnersData = await getLastTenWinnersForSocket();
-      
+
       emitToAll("newRound", {
         roundNumber: currentRound.roundNumber,
         phase: "bidding",
@@ -516,82 +516,88 @@ const processRoundRewards = async (winnerData) => {
       return v === winningNumber;
     });
 
-    let winnerUserId = null;
-    let winnerBidId = null;
-    let reward = 0;
+    const multiplier = settings?.globalReturnMultiplier || 10;
+    const winnersList = [];
 
+    // 🔥 PROCESS ALL WINNERS (Not just one)
     if (matched.length > 0) {
-      const pick = matched[Math.floor(Math.random() * matched.length)];
-      winnerUserId = pick.userId;
-      winnerBidId = pick._id;
+      for (const winBid of matched) {
+        const reward = winBid.coins * multiplier;
 
-      const multiplier = settings?.globalReturnMultiplier || 10;
-      reward = pick.coins * multiplier;
+        // Update user's pending winning coins
+        const winnerUser = await User.findByIdAndUpdate(winBid.userId, {
+          $inc: { pendingWinningCoins: reward }
+        }, { new: true });
 
-      // Update user's pending winning coins
-      const winnerUser = await User.findByIdAndUpdate(winnerUserId, {
-        $inc: { pendingWinningCoins: reward }
-      }, { new: true });
+        // Update Bid
+        await Bid.findByIdAndUpdate(winBid._id, {
+          $set: {
+            result: "win",
+            reward: reward,
+            isManualWinner: isManual || false
+          }
+        });
 
-      // 🔥 ATTACH MANUAL WINNER INFO TO THE WINNING BID
-      await Bid.findByIdAndUpdate(winnerBidId, {
-        $set: {
-          result: "win",
-          reward: reward,
-          isManualWinner: isManual || false // 🔥 Store if this was a manual win
+        winnersList.push({
+          userId: winBid.userId,
+          bidId: winBid._id,
+          reward: reward
+        });
+
+        // 🔥 REAL-TIME BALANCE UPDATE - User won
+        if (isSocketReady() && winnerUser) {
+          emitToUser(winBid.userId.toString(), "balanceUpdate", {
+            success: true,
+            message: isManual
+              ? "Congratulations! You won with manual selection!"
+              : "Congratulations! You won the round!",
+            data: {
+              coins: winnerUser.coins,
+              pendingWinningCoins: winnerUser.pendingWinningCoins,
+              totalBalance: winnerUser.coins + winnerUser.pendingWinningCoins,
+              rewardAmount: reward,
+              roundWinningNumber: winningNumber,
+              isManualWinner: isManual,
+              type: "round_won"
+            },
+            timestamp: new Date().toISOString()
+          });
         }
+      }
+      console.log(`💰 ${isManual ? 'MANUAL ' : ''}Rewards processed for Round ${currentRound?.roundNumber}. Winners Count: ${matched.length}`);
+    }
+
+    // 🔥 BROADCAST WINNER INFO TO ALL
+    if (isSocketReady()) {
+      emitToAll("winnerAnnounced", {
+        roundNumber: currentRound?.roundNumber || 0,
+        winningNumber: winningNumber,
+        winners: winnersList, // Send list of winners
+        winnerCount: winnersList.length,
+        isManualWinner: isManual,
+        totalParticipants: bids.length,
+        timestamp: new Date().toISOString()
       });
-
-      // 🔥 REAL-TIME BALANCE UPDATE - User won
-      if (isSocketReady() && winnerUser) {
-        emitToUser(winnerUserId.toString(), "balanceUpdate", {
-          success: true,
-          message: isManual
-            ? "Congratulations! You won with manual selection!"
-            : "Congratulations! You won the round!",
-          data: {
-            coins: winnerUser.coins,
-            pendingWinningCoins: winnerUser.pendingWinningCoins,
-            totalBalance: winnerUser.coins + winnerUser.pendingWinningCoins,
-            rewardAmount: reward,
-            roundWinningNumber: winningNumber,
-            isManualWinner: isManual, // 🔥 Include manual winner flag
-            type: "round_won"
-          },
-          timestamp: new Date().toISOString()
-        });
-        console.log(`💰 ${isManual ? 'MANUAL ' : ''}Winner update sent to user: ${winnerUserId}`);
-      }
-
-      // 🔥 BROADCAST WINNER INFO TO ALL
-      if (isSocketReady()) {
-        emitToAll("winnerAnnounced", {
-          roundNumber: currentRound?.roundNumber || 0,
-          winningNumber: winningNumber,
-          winnerUserId: winnerUserId,
-          winnerBidId: winnerBidId,
-          rewardAmount: reward,
-          isManualWinner: isManual, // 🔥 Manual winner flag
-          totalParticipants: bids.length,
-          timestamp: new Date().toISOString()
-        });
-      }
     }
 
     // Mark losers and send them balance updates too
-    const losers = bids.filter(b => String(b._id) !== String(winnerBidId)).map(b => b._id);
+    // Losers are bids that are NOT in the matched list
+    const matchedIds = matched.map(b => String(b._id));
+    const losers = bids.filter(b => !matchedIds.includes(String(b._id)));
+
     if (losers.length) {
+      const loserIds = losers.map(b => b._id);
       await Bid.updateMany(
-        { _id: { $in: losers } },
+        { _id: { $in: loserIds } },
         {
           result: "lose",
           reward: 0,
-          isManualWinner: false // 🔥 Losers are not manual winners
+          isManualWinner: false
         }
       );
 
-      // 🔥 REAL-TIME BALANCE UPDATE - Losers (just current balance)
-      for (const bid of bids.filter(b => String(b._id) !== String(winnerBidId))) {
+      // 🔥 REAL-TIME BALANCE UPDATE - Losers
+      for (const bid of losers) {
         const loserUser = await User.findById(bid.userId);
         if (loserUser && isSocketReady()) {
           emitToUser(bid.userId.toString(), "balanceUpdate", {
@@ -602,7 +608,7 @@ const processRoundRewards = async (winnerData) => {
               pendingWinningCoins: loserUser.pendingWinningCoins,
               totalBalance: loserUser.coins + loserUser.pendingWinningCoins,
               roundWinningNumber: winningNumber,
-              isManualWinner: false, // 🔥 Losers are not manual winners
+              isManualWinner: false,
               type: "round_lost"
             },
             timestamp: new Date().toISOString()
@@ -611,7 +617,7 @@ const processRoundRewards = async (winnerData) => {
       }
     }
 
-    console.log(`💰 ${isManual ? 'MANUAL ' : ''}Rewards processed for Round ${currentRound?.roundNumber}`);
+    console.log(`💰 Rewards processing complete for Round ${currentRound?.roundNumber}`);
 
   } catch (error) {
     console.error("❌ Error processing rewards:", error);
@@ -627,14 +633,24 @@ const calculateWinner = async (roundId) => {
     const settings = await Settings.findOne();
 
     const counts = {};
-    for (let i = 0; i <= 9; i++) counts[i] = 0;
+    const amounts = {};
+    for (let i = 0; i <= 9; i++) {
+      counts[i] = 0;
+      amounts[i] = 0;
+    }
 
     for (const b of bids) {
       const v = b.bidNumber == 10 ? 0 : Number(b.bidNumber);
       counts[v]++;
+      amounts[v] += (b.coins || 0);
     }
 
-    console.log("📊 BID COUNT:", counts);
+    const summary = {};
+    for (let i = 0; i <= 9; i++) {
+      summary[i] = `${counts[i]}, ${amounts[i]}`;
+    }
+
+    console.log("📊 BID COUNT (Count, Amount):", summary);
 
     let winningNumber;
     const round = await Round.findById(roundId);
@@ -651,15 +667,25 @@ const calculateWinner = async (roundId) => {
       if (zeroDigits.length) {
         winningNumber = zeroDigits[Math.floor(Math.random() * zeroDigits.length)];
       } else {
-        const unique = Object.keys(counts)
-          .filter(k => counts[k] === 1)
-          .map(Number);
+        // All digits have at least one bid.
+        // Find the digit(s) with the LOWEST TOTAL AMOUNT.
 
-        if (unique.length) {
-          winningNumber = unique[0];
-        } else {
-          winningNumber = 0;
+        const allDigits = [];
+        for (let i = 0; i <= 9; i++) {
+          allDigits.push({ digit: i, amount: amounts[i] });
         }
+
+        // Find minimum amount
+        const minAmount = Math.min(...allDigits.map(d => d.amount));
+
+        // Get all digits that have this minimum amount
+        const candidates = allDigits.filter(d => d.amount === minAmount);
+
+        // Pick a random winner from the candidates (handles ties randomly)
+        const winnerObj = candidates[Math.floor(Math.random() * candidates.length)];
+
+        winningNumber = winnerObj.digit;
+        console.log(`🎯 All digits occupied. Lowest Amount: ${minAmount}. Candidates: [${candidates.map(c => c.digit).join(', ')}]. Winner: ${winningNumber}`);
       }
     }
 
