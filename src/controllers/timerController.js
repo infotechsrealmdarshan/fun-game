@@ -103,11 +103,16 @@ const startVisibleCycle = () => {
 
   console.log(`⏱️ VISIBLE CYCLE START: counting ${TIMELINE.VISIBLE_TIME - 1} → 0 (${TIMELINE.VISIBLE_TIME} ticks)`);
 
-  visibleInterval = setInterval(async () => {
-    if (visibleTickRunning) return; // skip this tick if the previous is still running
+  // Use a recursive timeout loop to ensure each tick finishes before scheduling next
+  let lastVisibleTickStart = Date.now();
+  const visibleTick = async () => {
+    // If another tick somehow still running, skip (defensive)
+    if (visibleTickRunning) return;
     visibleTickRunning = true;
+
+    const tickStart = Date.now();
     try {
-      // ✅ FIXED: Determine current phase dynamically
+      // ✅ Determine current phase dynamically
       let currentPhase = "bidding";
       let biddingLocked = false;
 
@@ -119,7 +124,6 @@ const startVisibleCycle = () => {
       // Update round in database with current phase and lock status
       if (currentRound && currentRound._id) {
         try {
-          // Update only if phase has changed
           if (currentRound.phase !== currentPhase || currentRound.biddingLocked !== biddingLocked) {
             currentRound.phase = currentPhase;
             currentRound.biddingLocked = biddingLocked;
@@ -133,11 +137,10 @@ const startVisibleCycle = () => {
 
       // Emit timerUpdate ONLY during visible time
       if (isSocketReady()) {
-        // Prevent emitting the same `timeLeft` more than once (duplicates seen as 3,2,2,0)
         if (lastEmittedVisible !== visibleTimeLeft) {
           emitToAll("timerUpdate", {
             roundNumber: currentRound?.roundNumber || 0,
-            phase: currentPhase,  // ✅ Use dynamic phase
+            phase: currentPhase,
             timeLeft: visibleTimeLeft,
             status: "running",
             totalCycle: TIMELINE.TOTAL_CYCLE,
@@ -145,12 +148,10 @@ const startVisibleCycle = () => {
             timestamp: new Date().toISOString()
           });
           lastEmittedVisible = visibleTimeLeft;
-        } else {
-          // Skip duplicate emit for same timeLeft
         }
       }
 
-      // Manual winner window: 10s to 3s (emit once at window start)
+      // Manual winner window
       if (visibleTimeLeft === TIMELINE.MANUAL_WINNER_WINDOW_START) {
         if (isSocketReady()) {
           const duration = TIMELINE.MANUAL_WINNER_WINDOW_START - TIMELINE.MANUAL_WINNER_WINDOW_END + 1;
@@ -166,13 +167,11 @@ const startVisibleCycle = () => {
         }
       }
 
-      // At visible 3s (57s elapsed): additionally emit phaseChange event
+      // Phase change at MANUAL_PHASE_CHANGE_AT
       if (visibleTimeLeft === TIMELINE.MANUAL_PHASE_CHANGE_AT) {
         try {
           console.log(`🔄 Phase transition: bidding → hold (Round ${currentRound?.roundNumber})`);
-
           if (isSocketReady()) {
-            // 🔥 Include winningNumber in phaseChange if already calculated
             const phaseChangeData = {
               roundNumber: currentRound?.roundNumber || 0,
               phase: "hold",
@@ -180,25 +179,21 @@ const startVisibleCycle = () => {
               message: "Pausing bidding - moving to hold (57s elapsed)",
               timestamp: new Date().toISOString()
             };
-
-            // If winner is already calculated, include it in the event
             if (winnerCalculated && calculatedWinner) {
               const winningNumber = calculatedWinner.storedWinningNumber === 10 ? 0 : calculatedWinner.storedWinningNumber;
               phaseChangeData.winningNumber = winningNumber;
               phaseChangeData.isManualWinner = currentRound.isManualWinner || false;
               console.log(`📍 Included winner in phaseChange: ${winningNumber}`);
             }
-
             emitToAll("phaseChange", phaseChangeData);
           }
-
           console.log(`🔒 Bidding locked for Round ${currentRound.roundNumber}`);
         } catch (err) {
           console.error("❌ Error setting phaseChange at 57s:", err);
         }
       }
 
-      // At visible 2s: calculate winner so result is ready before 0s
+      // Pre-calc winner at VISIBLE_CALCULATE_WINNER_AT
       if (visibleTimeLeft === TIMELINE.VISIBLE_CALCULATE_WINNER_AT) {
         try {
           console.log(`🎯 Visible 2s → Pre-calculating winner`);
@@ -210,7 +205,7 @@ const startVisibleCycle = () => {
         }
       }
 
-      // At visible 0s: Emit playSpin using pre-calculated winner (or calculate if missing)
+      // Play spin at 0
       if (visibleTimeLeft === TIMELINE.VISIBLE_PLAY_SPIN) {
         console.log(`🎰 Visible 0s → Emitting playSpin with prepared winner`);
         if (!winnerCalculated) {
@@ -221,18 +216,28 @@ const startVisibleCycle = () => {
 
       visibleTimeLeft--;
 
-      // When visible time reaches 0, transition to hidden cycle
+      // Transition to hidden cycle
       if (visibleTimeLeft < 0) {
-        clearInterval(visibleInterval);
+        // clear any pending visible timeout
+        if (visibleInterval) clearTimeout(visibleInterval);
         console.log(`✅ VISIBLE CYCLE COMPLETE - Starting HIDDEN CYCLE`);
         startHiddenCycle();
+        return; // don't schedule next visible tick
       }
     } catch (err) {
       console.error("❌ Error in visible cycle:", err);
     } finally {
       visibleTickRunning = false;
     }
-  }, 1000);
+
+    // schedule next tick trying to maintain ~1s gap
+    const elapsed = Date.now() - tickStart;
+    const delay = Math.max(0, 1000 - elapsed);
+    visibleInterval = setTimeout(visibleTick, delay);
+  };
+
+  // start first tick
+  visibleInterval = setTimeout(visibleTick, 0);
 };
 
 /* ============================================================
@@ -243,9 +248,11 @@ const startHiddenCycle = () => {
 
   hiddenTimeLeft = TIMELINE.HIDDEN_TIME;
 
-  hiddenInterval = setInterval(async () => {
-    if (hiddenTickRunning) return; // skip if previous hidden tick still running
+  // Hidden cycle using recursive timeout to avoid overlaps and drift
+  const hiddenTick = async () => {
+    if (hiddenTickRunning) return;
     hiddenTickRunning = true;
+    const tickStart = Date.now();
     try {
       // At hiddenLeft = 3: Process rewards and complete round (do not re-emit playSpin)
       if (hiddenTimeLeft === TIMELINE.HIDDEN_ROUND_COMPLETE) {
@@ -268,16 +275,25 @@ const startHiddenCycle = () => {
 
       // At hiddenLeft = 0: Start new round
       if (hiddenTimeLeft < 0) {
-        clearInterval(hiddenInterval);
+        if (hiddenInterval) clearTimeout(hiddenInterval);
         console.log(`✅ HIDDEN CYCLE COMPLETE → Starting NEW ROUND`);
         await startNewRound();
+        return;
       }
     } catch (err) {
       console.error("❌ Error in hidden cycle:", err);
     } finally {
       hiddenTickRunning = false;
     }
-  }, 1000);
+
+    // schedule next hidden tick
+    const elapsed = Date.now() - tickStart;
+    const delay = Math.max(0, 1000 - elapsed);
+    hiddenInterval = setTimeout(hiddenTick, delay);
+  };
+
+  // start hidden loop
+  hiddenInterval = setTimeout(hiddenTick, 0);
 };
 
 /* ============================================================
@@ -715,8 +731,8 @@ export const getCurrentElapsedTime = () => {
    STOP TIMER (cleanup)
 ============================================================*/
 export const stopTimer = () => {
-  if (visibleInterval) clearInterval(visibleInterval);
-  if (hiddenInterval) clearInterval(hiddenInterval);
+  if (visibleInterval) clearTimeout(visibleInterval);
+  if (hiddenInterval) clearTimeout(hiddenInterval);
   if (hiddenTimeout) clearTimeout(hiddenTimeout);
   timerRunning = false;
   console.log("⛔ Timer stopped");
