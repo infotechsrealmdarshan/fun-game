@@ -72,7 +72,10 @@ export const startGameTimer = async () => {
     }
 
     // Reset timers
-    visibleTimeLeft = TIMELINE.VISIBLE_TIME;
+    // Start visible countdown from TIMELINE.VISIBLE_TIME - 1 so the first
+    // emitted second is e.g. 59 (for a 60s visible window) and the UI
+    // receives one-second gaps: 59 .. 0
+    visibleTimeLeft = TIMELINE.VISIBLE_TIME - 1;
     hiddenTimeLeft = TIMELINE.HIDDEN_TIME;
 
     // Start the visible 60-second cycle
@@ -96,7 +99,7 @@ const startVisibleCycle = () => {
   // Reset last emitted guard so the new cycle starts clean
   lastEmittedVisible = null;
 
-  console.log(`⏱️ VISIBLE CYCLE START: 60s countdown`);
+  console.log(`⏱️ VISIBLE CYCLE START: counting ${TIMELINE.VISIBLE_TIME - 1} → 0 (${TIMELINE.VISIBLE_TIME} ticks)`);
 
   visibleInterval = setInterval(async () => {
     try {
@@ -442,7 +445,8 @@ const startNewRound = async () => {
       startTime: new Date()
     });
 
-    visibleTimeLeft = TIMELINE.VISIBLE_TIME;
+    // Start visible countdown from TIMELINE.VISIBLE_TIME - 1 so UI shows 59..0
+    visibleTimeLeft = TIMELINE.VISIBLE_TIME - 1;
     hiddenTimeLeft = TIMELINE.HIDDEN_TIME;
     winnerCalculated = false;
     calculatedWinner = null;
@@ -457,9 +461,9 @@ const startNewRound = async () => {
         roundNumber: currentRound.roundNumber,
         phase: "bidding",
         status: "running",
-        timeLeft: TIMELINE.VISIBLE_TIME,
-        lastTenWinners: winnersData.lastTenWinners, // 🔥 Added last 10 winners array
-        lastTenWinnersString: winnersData.lastTenWinnersString, // 🔥 Added comma-separated string
+        timeLeft: visibleTimeLeft,
+        lastTenWinners: winnersData.lastTenWinners,
+        lastTenWinnersString: winnersData.lastTenWinnersString,
         timestamp: new Date().toISOString()
       });
       console.log(`📡 EMITTED newRound: #${currentRound.roundNumber} with last 10 winners`);
@@ -686,8 +690,9 @@ export const getTimeline = () => TIMELINE;
    Returns elapsed seconds from timer state (not from DB)
 ============================================================*/
 export const getCurrentElapsedTime = () => {
-  // During visible cycle: elapsed = VISIBLE_TIME - visibleTimeLeft
-  const elapsedDuringVisible = TIMELINE.VISIBLE_TIME - visibleTimeLeft;
+  // During visible cycle: visibleTimeLeft starts at VISIBLE_TIME - 1 (e.g. 59)
+  // so elapsed should be calculated against that start value.
+  const elapsedDuringVisible = (TIMELINE.VISIBLE_TIME - 1) - visibleTimeLeft;
   return {
     elapsedSeconds: elapsedDuringVisible,
     visibleTimeLeft: visibleTimeLeft,
